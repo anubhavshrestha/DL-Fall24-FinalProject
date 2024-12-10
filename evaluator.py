@@ -211,9 +211,9 @@ class ProbingEvaluator:
             # TODO: Forward pass through your model
             init_states = batch.states[:, 0:1]  # BS, 1 C, H, W
             pred_encs = model(states=init_states, actions=batch.actions)
-            print("INIT STATE: ", init_states)
-            print("ACTIONS: ", batch.actions)
-            print(" pred_encs: ", pred_encs.shape)
+            # print("INIT STATE: ", init_states)
+            # print("ACTIONS: ", batch.actions)
+            # print(" pred_encs: ", pred_encs.shape)
             # # BS, T, D --> T, BS, D
             pred_encs = pred_encs.transpose(0, 1)
 

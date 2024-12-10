@@ -8,6 +8,55 @@ from tqdm import tqdm
 from dataset import WallSample, create_wall_dataloader
 from models import Encoder, TransitionModel, WorldModel, Prober
 import wandb
+from evaluator import ProbingEvaluator
+
+def load_data(device):
+    data_path = "/drive_reader/as16386/DL24FA"
+
+    probe_train_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_normal/train",
+        probing=True,
+        device=device,
+        train=True,
+    )
+
+    probe_val_normal_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_normal/val",
+        probing=True,
+        device=device,
+        train=False,
+    )
+
+    probe_val_wall_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_wall/val",
+        probing=True,
+        device=device,
+        train=False,
+    )
+
+    probe_val_ds = {"normal": probe_val_normal_ds, "wall": probe_val_wall_ds}
+
+    return probe_train_ds, probe_val_ds
+
+def evaluate_model(device, model, probe_train_ds, probe_val_ds):
+    evaluator = ProbingEvaluator(
+        device=device,
+        model=model,
+        probe_train_ds=probe_train_ds,
+        probe_val_ds=probe_val_ds,
+        quick_debug=False,
+    )
+
+    prober = evaluator.train_pred_prober()
+
+    avg_losses = evaluator.evaluate_all(prober=prober)
+
+
+    for probe_attr, loss in avg_losses.items():
+        print(f"{probe_attr} loss: {loss}")
+    
+    return avg_losses
+    
 
 class VICRegLoss(nn.Module):
     def __init__(self, lambda_param=25.0, mu_param=25.0, nu_param=1.0):
@@ -66,6 +115,89 @@ class VICRegLoss(nn.Module):
         
         return total_loss, losses
 
+# class WorldModelVICReg(nn.Module):
+#     def __init__(self, lambda_param=25.0, mu_param=25.0, nu_param=1.0):
+#         super().__init__()
+#         self.encoder = Encoder(input_channels=2)
+#         self.predictor = TransitionModel(hidden_dim=32)
+#         self.criterion = VICRegLoss(lambda_param, mu_param, nu_param)
+#         self.repr_dim = 32 * 8 * 8
+    
+#     def compute_vicreg_loss(self, pred_state, target_obs):
+#         """Compute VICReg loss between predicted and encoded target states"""
+#         # Get target encoding
+#         target_state = self.encoder(target_obs)
+        
+#         # Flatten spatial dimensions: [B, 32, 8, 8] -> [B, 2048]
+#         pred_flat = pred_state.flatten(start_dim=1)
+#         target_flat = target_state.flatten(start_dim=1)
+        
+#         # Compute VICReg losses
+#         total_loss, component_losses = self.criterion(pred_flat, target_flat)
+#         return total_loss, component_losses
+    
+#     def training_step(self, batch):
+#         states = batch.states
+#         actions = batch.actions
+        
+#         # Get initial state
+#         init_states = states[:, 0:1]
+        
+#         # Get predictions for all steps
+#         predictions = self.forward_prediction(init_states, actions)
+        
+#         # Initialize losses
+#         total_loss = 0.0
+#         accumulated_losses = {
+#             'sim_loss': 0.0,
+#             'std_loss': 0.0,
+#             'cov_loss': 0.0,
+#             'total_loss': 0.0
+#         }
+        
+#         # Compute VICReg loss for each timestep
+#         for t in range(actions.shape[1]):
+#             pred_state = predictions[:, t+1]
+#             target_obs = states[:, t+1]
+            
+#             loss, component_losses = self.compute_vicreg_loss(pred_state, target_obs)
+#             total_loss += loss
+            
+#             # Accumulate component losses
+#             for k in accumulated_losses:
+#                 accumulated_losses[k] += component_losses[k]
+        
+#         # Average losses over timesteps
+#         for k in accumulated_losses:
+#             accumulated_losses[k] /= actions.shape[1]
+        
+#         return total_loss / actions.shape[1], predictions, accumulated_losses
+
+
+#     def forward_prediction(self, states, actions):
+#         """
+#         Forward pass for prediction of future states
+#         Args:
+#             states: [B, 1, 2, 65, 65] - Initial state only
+#             actions: [B, T-1, 2] - Sequence of T-1 actions
+#         Returns:
+#             predictions: [B, T, 32, 8, 8] - Predicted representations
+#         """
+#         B, _, _, H, W = states.shape
+#         T = actions.shape[1] + 1
+        
+#         # Get initial state encoding
+#         curr_state = self.encoder(states.squeeze(1))
+#         predictions = [curr_state]
+        
+#         # Predict future states
+#         for t in range(T-1):
+#             curr_state = self.predictor(curr_state, actions[:, t])
+#             predictions.append(curr_state)
+            
+#         predictions = torch.stack(predictions, dim=1)
+#         return predictions
+
 class WorldModelVICReg(nn.Module):
     def __init__(self, lambda_param=25.0, mu_param=25.0, nu_param=1.0):
         super().__init__()
@@ -73,6 +205,51 @@ class WorldModelVICReg(nn.Module):
         self.predictor = TransitionModel(hidden_dim=32)
         self.criterion = VICRegLoss(lambda_param, mu_param, nu_param)
         self.repr_dim = 32 * 8 * 8
+    
+    def forward(self, states, actions):
+        """
+        Forward pass for evaluation
+        Args:
+            states: [B, T, 2, H, W] - Full sequence of states
+            actions: [B, T-1, 2] - Sequence of T-1 actions
+        Returns:
+            predictions: [B, T, D] - Predicted representations
+        """
+        # Get initial state only
+        init_states = states[:, 0:1]  # [B, 1, 2, H, W]
+        
+        # Use forward_prediction for consistency
+        predictions = self.forward_prediction(init_states, actions)
+        
+        # Reshape predictions to [B, T, D]
+        B, T, C, H, W = predictions.shape
+        predictions = predictions.view(B, T, -1)
+        
+        return predictions
+    
+    def forward_prediction(self, states, actions):
+        """
+        Forward pass for prediction of future states
+        Args:
+            states: [B, 1, 2, H, W] - Initial state only
+            actions: [B, T-1, 2] - Sequence of T-1 actions
+        Returns:
+            predictions: [B, T, 32, 8, 8] - Predicted representations
+        """
+        B, _, _, H, W = states.shape
+        T = actions.shape[1] + 1
+        
+        # Get initial state encoding
+        curr_state = self.encoder(states.squeeze(1))
+        predictions = [curr_state]
+        
+        # Predict future states
+        for t in range(T-1):
+            curr_state = self.predictor(curr_state, actions[:, t])
+            predictions.append(curr_state)
+            
+        predictions = torch.stack(predictions, dim=1)
+        return predictions
     
     def compute_vicreg_loss(self, pred_state, target_obs):
         """Compute VICReg loss between predicted and encoded target states"""
@@ -123,31 +300,6 @@ class WorldModelVICReg(nn.Module):
             accumulated_losses[k] /= actions.shape[1]
         
         return total_loss / actions.shape[1], predictions, accumulated_losses
-
-
-    def forward_prediction(self, states, actions):
-        """
-        Forward pass for prediction of future states
-        Args:
-            states: [B, 1, 2, 65, 65] - Initial state only
-            actions: [B, T-1, 2] - Sequence of T-1 actions
-        Returns:
-            predictions: [B, T, 32, 8, 8] - Predicted representations
-        """
-        B, _, _, H, W = states.shape
-        T = actions.shape[1] + 1
-        
-        # Get initial state encoding
-        curr_state = self.encoder(states.squeeze(1))
-        predictions = [curr_state]
-        
-        # Predict future states
-        for t in range(T-1):
-            curr_state = self.predictor(curr_state, actions[:, t])
-            predictions.append(curr_state)
-            
-        predictions = torch.stack(predictions, dim=1)
-        return predictions
 
 import os 
 
@@ -298,6 +450,15 @@ class WorldModelTrainer:
                 best_val_loss = val_loss
                 self.save_checkpoint(epoch, val_loss)
                 print("New best model saved!")
+            
+            losses = evaluate_model(self.device, self.model, self.probe_train_data, self.probe_val_data)
+            normal_loss = losses['normal']
+            wall_loss = losses['wall']
+            wandb.log({
+                "Normal_loss:": normal_loss,
+                "wall_loss": wall_loss
+            })
+            
 
         # Finish WandB session
         wandb.finish()
@@ -332,11 +493,12 @@ model = WorldModelVICReg(
 )
 
 train_loader, val_loader = create_train_val_loaders(
-    data_path="/scratch/an3854/DL24FA/train",
+    data_path="/drive_reader/as16386/DL24FA/train",
     train_samples=None,
     val_samples=None
 )
+probe_train_ds, probe_val_ds = load_data("cuda")
 
-trainer = WorldModelTrainer(model, train_loader, val_loader)
+trainer = WorldModelTrainer(model = model, train_loader = train_loader, val_loader = val_loader, probe_train_data=probe_train_ds, probe_val_data=probe_val_ds)
 trainer.train(num_epochs=100)
 
