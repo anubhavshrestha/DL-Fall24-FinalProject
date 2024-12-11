@@ -1,18 +1,68 @@
+import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-import numpy as np
 from datetime import datetime
 from tqdm import tqdm
-from dataset import WallSample, create_wall_dataloader
-from models import Encoder, TransitionModel, WorldModel, Prober
 import wandb
+import os
+from models import WorldModelVICReg, Encoder, TransitionModel, VICRegLoss, BarlowTwinsLoss
+from dataset import WallSample, create_wall_dataloader
 from evaluator import ProbingEvaluator
 
+
+def get_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Train World Model')
+    
+    # Existing arguments
+    parser.add_argument('--loss_type', type=str, default='vicreg', choices=['vicreg', 'barlow'],
+                      help='Loss function to use (default: vicreg)')
+    parser.add_argument('--use_validation', action='store_true',
+                      help='Whether to perform validation (default: False)')
+    parser.add_argument('--wandb_project', type=str, default='world-model',
+                      help='WandB project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                      help='WandB entity/username')
+    parser.add_argument('--save_frequency', type=int, default=1,
+                      help='Save checkpoints every N epochs (default: 1)')
+    parser.add_argument('--wandb_name', type=str, required=True,
+                      help='Name for this run (used for checkpoint directory)')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                      help='Directory to save checkpoints')
+
+    # Training hyperparameters
+    parser.add_argument('--learning_rate', type=float, default=3e-5,
+                      help='Learning rate (default: 3e-5)')
+    parser.add_argument('--weight_decay', type=float, default=1e-5,
+                      help='Weight decay (default: 1e-5)')
+    parser.add_argument('--batch_size', type=int, default=128,
+                      help='Batch size (default: 128)')
+    parser.add_argument('--num_epochs', type=int, default=100,
+                      help='Number of epochs to train (default: 100)')
+    parser.add_argument('--prober_lr', type=float, default=1e-3,
+                      help='Learning rate for prober (default: 1e-3)')
+    parser.add_argument('--scheduler', type=str, default='cosine', 
+                      choices=['cosine', 'onecycle', 'none'],
+                      help='Learning rate scheduler (default: cosine)')
+    # Loss function hyperparameters
+    parser.add_argument('--lambda_param', type=float, default=None,
+                      help='Lambda parameter (default: 25.0 for VICReg, 0.005 for Barlow)')
+    parser.add_argument('--mu_param', type=float, default=None,
+                      help='Mu parameter for VICReg (default: 25.0)')
+    parser.add_argument('--nu_param', type=float, default=None,
+                      help='Nu parameter for VICReg (default: 1.0)')
+
+    return parser.parse_args()
+
+
 def load_data(device):
+    """
+    Load probe datasets for evaluation.
+    Returns train dataset and validation datasets (normal and wall scenarios)
+    """
     data_path = "/drive_reader/as16386/DL24FA"
 
+    # Load probe training data
     probe_train_ds = create_wall_dataloader(
         data_path=f"{data_path}/probe_normal/train",
         probing=True,
@@ -20,6 +70,7 @@ def load_data(device):
         train=True,
     )
 
+    # Load probe validation data for both scenarios
     probe_val_normal_ds = create_wall_dataloader(
         data_path=f"{data_path}/probe_normal/val",
         probing=True,
@@ -35,320 +86,99 @@ def load_data(device):
     )
 
     probe_val_ds = {"normal": probe_val_normal_ds, "wall": probe_val_wall_ds}
-
     return probe_train_ds, probe_val_ds
 
 def evaluate_model(device, model, probe_train_ds, probe_val_ds):
+    """
+    Evaluate model using probe datasets.
+    Returns average losses for normal and wall scenarios.
+    """
     evaluator = ProbingEvaluator(
         device=device,
         model=model,
         probe_train_ds=probe_train_ds,
         probe_val_ds=probe_val_ds,
         quick_debug=False,
+        learning_rate=args.prober_lr 
     )
 
+    # Train and evaluate prober
     prober = evaluator.train_pred_prober()
-
     avg_losses = evaluator.evaluate_all(prober=prober)
-
 
     for probe_attr, loss in avg_losses.items():
         print(f"{probe_attr} loss: {loss}")
     
     return avg_losses
-    
-
-class VICRegLoss(nn.Module):
-    def __init__(self, lambda_param=25.0, mu_param=25.0, nu_param=1.0):
-        super().__init__()
-        self.lambda_param = lambda_param  # invariance loss coefficient
-        self.mu_param = mu_param         # variance loss coefficient
-        self.nu_param = nu_param         # covariance loss coefficient
-    
-    def off_diagonal(self, x):
-        """Return off-diagonal elements of a square matrix"""
-        n = x.shape[0]
-        return x.flatten()[:-1].view(n-1, n+1)[:, 1:].flatten()
-    
-    def forward(self, z_a, z_b):
-        """
-        Args:
-            z_a, z_b: Batch of representations [N, D]
-        Returns:
-            total_loss: Combined VICReg loss
-            losses: Dictionary containing individual loss components
-        """
-        N = z_a.shape[0]  # batch size
-        D = z_a.shape[1]  # dimension
-        
-        # Invariance loss (MSE)
-        sim_loss = F.mse_loss(z_a, z_b)
-        
-        # Variance loss
-        std_z_a = torch.sqrt(z_a.var(dim=0) + 1e-04)
-        std_z_b = torch.sqrt(z_b.var(dim=0) + 1e-04)
-        std_loss = (torch.mean(F.relu(1 - std_z_a)) + 
-                   torch.mean(F.relu(1 - std_z_b)))
-        
-        # Covariance loss
-        z_a = z_a - z_a.mean(dim=0)
-        z_b = z_b - z_b.mean(dim=0)
-        
-        cov_z_a = (z_a.T @ z_a) / (N - 1)
-        cov_z_b = (z_b.T @ z_b) / (N - 1)
-        
-        cov_loss = (self.off_diagonal(cov_z_a).pow_(2).sum() / D +
-                   self.off_diagonal(cov_z_b).pow_(2).sum() / D)
-        
-        # Combine losses
-        total_loss = (self.lambda_param * sim_loss + 
-                     self.mu_param * std_loss + 
-                     self.nu_param * cov_loss)
-        
-        # Return individual losses for logging
-        losses = {
-            'sim_loss': sim_loss.item(),
-            'std_loss': std_loss.item(),
-            'cov_loss': cov_loss.item(),
-            'total_loss': total_loss.item()
-        }
-        
-        return total_loss, losses
-
-# class WorldModelVICReg(nn.Module):
-#     def __init__(self, lambda_param=25.0, mu_param=25.0, nu_param=1.0):
-#         super().__init__()
-#         self.encoder = Encoder(input_channels=2)
-#         self.predictor = TransitionModel(hidden_dim=32)
-#         self.criterion = VICRegLoss(lambda_param, mu_param, nu_param)
-#         self.repr_dim = 32 * 8 * 8
-    
-#     def compute_vicreg_loss(self, pred_state, target_obs):
-#         """Compute VICReg loss between predicted and encoded target states"""
-#         # Get target encoding
-#         target_state = self.encoder(target_obs)
-        
-#         # Flatten spatial dimensions: [B, 32, 8, 8] -> [B, 2048]
-#         pred_flat = pred_state.flatten(start_dim=1)
-#         target_flat = target_state.flatten(start_dim=1)
-        
-#         # Compute VICReg losses
-#         total_loss, component_losses = self.criterion(pred_flat, target_flat)
-#         return total_loss, component_losses
-    
-#     def training_step(self, batch):
-#         states = batch.states
-#         actions = batch.actions
-        
-#         # Get initial state
-#         init_states = states[:, 0:1]
-        
-#         # Get predictions for all steps
-#         predictions = self.forward_prediction(init_states, actions)
-        
-#         # Initialize losses
-#         total_loss = 0.0
-#         accumulated_losses = {
-#             'sim_loss': 0.0,
-#             'std_loss': 0.0,
-#             'cov_loss': 0.0,
-#             'total_loss': 0.0
-#         }
-        
-#         # Compute VICReg loss for each timestep
-#         for t in range(actions.shape[1]):
-#             pred_state = predictions[:, t+1]
-#             target_obs = states[:, t+1]
-            
-#             loss, component_losses = self.compute_vicreg_loss(pred_state, target_obs)
-#             total_loss += loss
-            
-#             # Accumulate component losses
-#             for k in accumulated_losses:
-#                 accumulated_losses[k] += component_losses[k]
-        
-#         # Average losses over timesteps
-#         for k in accumulated_losses:
-#             accumulated_losses[k] /= actions.shape[1]
-        
-#         return total_loss / actions.shape[1], predictions, accumulated_losses
-
-
-#     def forward_prediction(self, states, actions):
-#         """
-#         Forward pass for prediction of future states
-#         Args:
-#             states: [B, 1, 2, 65, 65] - Initial state only
-#             actions: [B, T-1, 2] - Sequence of T-1 actions
-#         Returns:
-#             predictions: [B, T, 32, 8, 8] - Predicted representations
-#         """
-#         B, _, _, H, W = states.shape
-#         T = actions.shape[1] + 1
-        
-#         # Get initial state encoding
-#         curr_state = self.encoder(states.squeeze(1))
-#         predictions = [curr_state]
-        
-#         # Predict future states
-#         for t in range(T-1):
-#             curr_state = self.predictor(curr_state, actions[:, t])
-#             predictions.append(curr_state)
-            
-#         predictions = torch.stack(predictions, dim=1)
-#         return predictions
-
-class WorldModelVICReg(nn.Module):
-    def __init__(self, lambda_param=25.0, mu_param=25.0, nu_param=1.0):
-        super().__init__()
-        self.encoder = Encoder(input_channels=2)
-        self.predictor = TransitionModel(hidden_dim=32)
-        self.criterion = VICRegLoss(lambda_param, mu_param, nu_param)
-        self.repr_dim = 32 * 8 * 8
-    
-    def forward(self, states, actions):
-        """
-        Forward pass for evaluation
-        Args:
-            states: [B, T, 2, H, W] - Full sequence of states
-            actions: [B, T-1, 2] - Sequence of T-1 actions
-        Returns:
-            predictions: [B, T, D] - Predicted representations
-        """
-        # Get initial state only
-        init_states = states[:, 0:1]  # [B, 1, 2, H, W]
-        
-        # Use forward_prediction for consistency
-        predictions = self.forward_prediction(init_states, actions)
-        
-        # Reshape predictions to [B, T, D]
-        B, T, C, H, W = predictions.shape
-        predictions = predictions.view(B, T, -1)
-        
-        return predictions
-    
-    def forward_prediction(self, states, actions):
-        """
-        Forward pass for prediction of future states
-        Args:
-            states: [B, 1, 2, H, W] - Initial state only
-            actions: [B, T-1, 2] - Sequence of T-1 actions
-        Returns:
-            predictions: [B, T, 32, 8, 8] - Predicted representations
-        """
-        B, _, _, H, W = states.shape
-        T = actions.shape[1] + 1
-        
-        # Get initial state encoding
-        curr_state = self.encoder(states.squeeze(1))
-        predictions = [curr_state]
-        
-        # Predict future states
-        for t in range(T-1):
-            curr_state = self.predictor(curr_state, actions[:, t])
-            predictions.append(curr_state)
-            
-        predictions = torch.stack(predictions, dim=1)
-        return predictions
-    
-    def compute_vicreg_loss(self, pred_state, target_obs):
-        """Compute VICReg loss between predicted and encoded target states"""
-        # Get target encoding
-        target_state = self.encoder(target_obs)
-        
-        # Flatten spatial dimensions: [B, 32, 8, 8] -> [B, 2048]
-        pred_flat = pred_state.flatten(start_dim=1)
-        target_flat = target_state.flatten(start_dim=1)
-        
-        # Compute VICReg losses
-        total_loss, component_losses = self.criterion(pred_flat, target_flat)
-        return total_loss, component_losses
-    
-    def training_step(self, batch):
-        states = batch.states
-        actions = batch.actions
-        
-        # Get initial state
-        init_states = states[:, 0:1]
-        
-        # Get predictions for all steps
-        predictions = self.forward_prediction(init_states, actions)
-        
-        # Initialize losses
-        total_loss = 0.0
-        accumulated_losses = {
-            'sim_loss': 0.0,
-            'std_loss': 0.0,
-            'cov_loss': 0.0,
-            'total_loss': 0.0
-        }
-        
-        # Compute VICReg loss for each timestep
-        for t in range(actions.shape[1]):
-            pred_state = predictions[:, t+1]
-            target_obs = states[:, t+1]
-            
-            loss, component_losses = self.compute_vicreg_loss(pred_state, target_obs)
-            total_loss += loss
-            
-            # Accumulate component losses
-            for k in accumulated_losses:
-                accumulated_losses[k] += component_losses[k]
-        
-        # Average losses over timesteps
-        for k in accumulated_losses:
-            accumulated_losses[k] /= actions.shape[1]
-        
-        return total_loss / actions.shape[1], predictions, accumulated_losses
-
-import os 
-
-
-import wandb
 
 class WorldModelTrainer:
     def __init__(self, model, train_loader, val_loader, learning_rate=3e-5, 
-                 device='cuda', log_dir='runs', probe_train_data=None, probe_val_data=None):
+             device='cuda', probe_train_data=None, probe_val_data=None,
+             use_validation=False, wandb_project=None, wandb_name=None,
+             checkpoint_dir='checkpoints', save_frequency=1, scheduler_type='cosine'):
+
         self.model = model.to(device)
-        print(f"Using device: {device}")
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
         self.probe_train_data = probe_train_data
         self.probe_val_data = probe_val_data
+        self.use_validation = use_validation
+        self.checkpoint_dir = os.path.join(checkpoint_dir, wandb_name)
+        self.save_frequency = save_frequency
         
-        # Initialize TensorBoard writer
-        current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
-        self.writer = SummaryWriter(f'{log_dir}/{current_time}')
+        # Create checkpoint directory
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         
-        # Save hyperparameters
-        self.writer.add_text('hyperparameters', f'''
-        learning_rate: {learning_rate}
-        batch_size: {train_loader.batch_size}
-        model_channels: {model.encoder.repr_dim}
-        ''')
-
-        # Initialize WandB
-        wandb.init(
-            project="world-model-vicreg",  # Replace with your project name
-            config={
-                "learning_rate": learning_rate,
-                "batch_size": train_loader.batch_size,
-                "num_epochs": 100,  # Default value; update as necessary
-                "device": device,
-            }
+        # Initialize optimizer
+        self.optimizer = torch.optim.Adam(
+            model.parameters(), 
+            lr=learning_rate, 
+            weight_decay=1e-5
         )
-        wandb.watch(model, log="all", log_freq=10)
+
+
+        if scheduler_type == 'cosine':
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=args.num_epochs,
+                eta_min=1e-6
+            )
+        elif scheduler_type == 'onecycle':
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=learning_rate,
+                epochs=args.num_epochs,
+                steps_per_epoch=len(train_loader),
+                pct_start=0.3  # 30% of training for warmup
+            )
+        else:
+            self.scheduler = None
+
+            
+        # Initialize WandB
+        if wandb_project:
+            wandb.init(
+                project=wandb_project,
+                config={
+                    "learning_rate": learning_rate,
+                    "batch_size": train_loader.batch_size,
+                    "loss_type": model.loss_type,
+                    "use_validation": use_validation,
+                }
+            )
+            # Log model architecture
+            wandb.watch(model, log="all", log_freq=10)
 
     def validate(self, epoch):
+        """Run validation loop and compute losses."""
         self.model.eval()
         total_val_loss = 0.0
         val_losses = {
             'total_loss': 0.0,
-            'sim_loss': 0.0,
-            'std_loss': 0.0,
-            'cov_loss': 0.0
+            'sim_loss' if self.model.loss_type == 'vicreg' else 'on_diag_loss': 0.0,
+            'std_loss' if self.model.loss_type == 'vicreg' else 'off_diag_loss': 0.0,
+            'cov_loss' if self.model.loss_type == 'vicreg' else 'total_loss': 0.0
         }
         
         with torch.no_grad():
@@ -373,13 +203,14 @@ class WorldModelTrainer:
         return total_val_loss, val_losses
 
     def train_epoch(self, epoch):
+        """Train for one epoch."""
         self.model.train()
         total_train_loss = 0.0
         train_losses = {
             'total_loss': 0.0,
-            'sim_loss': 0.0,
-            'std_loss': 0.0,
-            'cov_loss': 0.0
+            'sim_loss' if self.model.loss_type == 'vicreg' else 'on_diag_loss': 0.0,
+            'std_loss' if self.model.loss_type == 'vicreg' else 'off_diag_loss': 0.0,
+            'cov_loss' if self.model.loss_type == 'vicreg' else 'total_loss': 0.0
         }
         
         for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch}")):
@@ -388,84 +219,117 @@ class WorldModelTrainer:
             states = batch.states.to(self.device)
             actions = batch.actions.to(self.device)
             
+            # Forward pass and compute loss
             loss, _, component_losses = self.model.training_step(
                 WallSample(states=states, actions=actions, locations=batch.locations)
             )
             
-            # Add backpropagation steps
+            # Backward pass
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             self.optimizer.step()
+            
+            # Step OneCycleLR scheduler if used (needs per-batch stepping)
+            if self.scheduler is not None and isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+                self.scheduler.step()
 
             # Update running losses
             total_train_loss += loss.item()
             for k in train_losses:
                 train_losses[k] += component_losses[k]
+            
+            # Log batch metrics to WandB
+            if wandb.run is not None and batch_idx % 10 == 0:
+                wandb.log({
+                    "batch": epoch * len(self.train_loader) + batch_idx,
+                    "batch_loss": loss.item(),
+                    "learning_rate": self.optimizer.param_groups[0]['lr'],
+                    **{f"batch_{k}": v for k, v in component_losses.items()}
+                })
         
+        # Average losses over epoch
         num_batches = len(self.train_loader)
         total_train_loss /= num_batches
         for k in train_losses:
             train_losses[k] /= num_batches
             
-        return total_train_loss, train_losses  
+        # Step other schedulers that need epoch-level stepping
+        if self.scheduler is not None and not isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            self.scheduler.step()
+                
+        return total_train_loss, train_losses
 
     def save_checkpoint(self, epoch, loss):
-        """Save model checkpoint"""
+        """Save model checkpoint."""
+        # Only save if it's time to do so
+        if (epoch + 1) % self.save_frequency != 0:
+            return
+            
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'loss': loss,
         }
-        os.makedirs('cnn_based_checkpoints', exist_ok=True)
-        path = f'cnn_based_checkpoints/checkpoint_epoch_{epoch}.pt'
+        
+        path = os.path.join(self.checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt')
         torch.save(checkpoint, path)
+        
+        if wandb.run is not None:
+            wandb.save(path)  # Save checkpoint to WandB
     
     def train(self, num_epochs):
-        best_val_loss = float('inf')
-        
+        """Main training loop."""
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            train_loss, train_losses = self.train_epoch(epoch)
-            val_loss, val_losses = self.validate(epoch)
             
-            # Log metrics to WandB
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                **{f"train_{k}": v for k, v in train_losses.items()},
-                **{f"val_{k}": v for k, v in val_losses.items()},
-            })
-
+            # Training
+            train_loss, train_losses = self.train_epoch(epoch)
+            
+            # Validation if enabled
+            if self.use_validation:
+                val_loss, val_losses = self.validate(epoch)
+                print("\nValidation Losses:")
+                for k, v in val_losses.items():
+                    print(f"{k}: {v:.4f}")
+            
+            # Print training summary
             print("\nEpoch Summary:")
             print("Training Losses:")
             for k, v in train_losses.items():
                 print(f"{k}: {v:.4f}")
-            print("\nValidation Losses:")
-            for k, v in val_losses.items():
-                print(f"{k}: {v:.4f}")
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_checkpoint(epoch, val_loss)
-                print("New best model saved!")
             
-            losses = evaluate_model(self.device, self.model, self.probe_train_data, self.probe_val_data)
+            # Save checkpoint
+            self.save_checkpoint(epoch, train_loss)
+            print("Model saved!")
+            
+            # Evaluate probing performance
+            losses = evaluate_model(self.device, self.model, 
+                                  self.probe_train_data, self.probe_val_data)
             normal_loss = losses['normal']
             wall_loss = losses['wall']
-            wandb.log({
-                "Normal_loss:": normal_loss,
-                "wall_loss": wall_loss
-            })
             
+            # Log epoch metrics to WandB
+            if wandb.run is not None:
+                wandb_logs = {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "normal_probe_loss": normal_loss,
+                    "wall_probe_loss": wall_loss,
+                    **{f"train_{k}": v for k, v in train_losses.items()}
+                }
+                
+                if self.use_validation:
+                    wandb_logs.update({
+                        "val_loss": val_loss,
+                        **{f"val_{k}": v for k, v in val_losses.items()}
+                    })
+                    
+                wandb.log(wandb_logs)
 
-        # Finish WandB session
-        wandb.finish()
-
-
-def create_train_val_loaders(data_path, train_samples=10000, val_samples=2000):
-
+def create_train_val_loaders(data_path, train_samples=None, val_samples=None):
+    """Create training and validation dataloaders."""
     train_loader = create_wall_dataloader(
         data_path=data_path,
         probing=False,
@@ -486,19 +350,43 @@ def create_train_val_loaders(data_path, train_samples=10000, val_samples=2000):
     
     return train_loader, val_loader
 
-model = WorldModelVICReg(
-    lambda_param=25.0,
-    mu_param=25.0,
-    nu_param=1.0
-)
 
-train_loader, val_loader = create_train_val_loaders(
-    data_path="/drive_reader/as16386/DL24FA/train",
-    train_samples=None,
-    val_samples=None
-)
-probe_train_ds, probe_val_ds = load_data("cuda")
+if __name__ == "__main__":
+    # Parse arguments
+    args = get_args()
+    
+    # Create model with specified loss
+    model = WorldModelVICReg(
+        loss_type=args.loss_type,
+        lambda_param=25.0 if args.loss_type == 'vicreg' else 0.005,
+        mu_param=25.0 if args.loss_type == 'vicreg' else None,
+        nu_param=1.0 if args.loss_type == 'vicreg' else None
+    )
 
-trainer = WorldModelTrainer(model = model, train_loader = train_loader, val_loader = val_loader, probe_train_data=probe_train_ds, probe_val_data=probe_val_ds)
-trainer.train(num_epochs=100)
+    # Create dataloaders
+    train_loader, val_loader = create_train_val_loaders(
+        data_path="/drive_reader/as16386/DL24FA/train",
+        train_samples=None,
+        val_samples=None
+    )
+    
+    # Load probe datasets
+    probe_train_ds, probe_val_ds = load_data("cuda")
 
+    # Initialize trainer
+    trainer = WorldModelTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        probe_train_data=probe_train_ds,
+        probe_val_data=probe_val_ds,
+        use_validation=args.use_validation,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
+        checkpoint_dir=args.checkpoint_dir,
+        save_frequency=args.save_frequency, 
+        scheduler_type=args.scheduler
+    )
+    
+    # Start training
+    trainer.train(num_epochs=100)

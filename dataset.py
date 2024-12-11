@@ -68,3 +68,33 @@ def create_wall_dataloader(
     )
 
     return loader
+
+
+
+def load_data(device):
+    data_path = "/drive_reader/as16386/DL24FA"
+
+    probe_train_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_normal/train",
+        probing=True,
+        device=device,
+        train=True,
+    )
+
+    probe_val_normal_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_normal/val",
+        probing=True,
+        device=device,
+        train=False,
+    )
+
+    probe_val_wall_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_wall/val",
+        probing=True,
+        device=device,
+        train=False,
+    )
+
+    probe_val_ds = {"normal": probe_val_normal_ds, "wall": probe_val_wall_ds}
+
+    return probe_train_ds, probe_val_ds

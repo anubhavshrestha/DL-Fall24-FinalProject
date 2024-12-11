@@ -1,2 +1,3 @@
-cnn_based_checkpoints
 runs
+checkpoints
+wandb 

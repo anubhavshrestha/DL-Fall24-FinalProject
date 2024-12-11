@@ -20,7 +20,7 @@ from normalizer import Normalizer
 @dataclass
 class ProbingConfig(ConfigBase):
     probe_targets: str = "locations"
-    lr: float = 0.0002
+    lr: float = 0.001
     epochs: int = 20
     schedule: LRSchedule = LRSchedule.Cosine
     sample_timesteps: int = 30
@@ -52,6 +52,7 @@ class ProbingEvaluator:
         probe_val_ds: dict,
         config: ProbingConfig = default_config,
         quick_debug: bool = False,
+        learning_rate: float = 1e-3
     ):
         self.device = device
         self.config = config
@@ -65,6 +66,7 @@ class ProbingEvaluator:
         self.val_ds = probe_val_ds
 
         self.normalizer = Normalizer()
+        self.learning_rate = learning_rate 
 
     def train_pred_prober(self):
         """
@@ -91,7 +93,7 @@ class ProbingEvaluator:
         all_parameters = []
         all_parameters += list(prober.parameters())
 
-        optimizer_pred_prober = torch.optim.Adam(all_parameters, config.lr)
+        optimizer_pred_prober = torch.optim.Adam(all_parameters, self.learning_rate)
 
         step = 0
 
@@ -234,3 +236,25 @@ class ProbingEvaluator:
         average_eval_loss = losses_t.mean().item()
 
         return average_eval_loss
+
+
+
+def evaluate_model(device, model, probe_train_ds, probe_val_ds):
+    evaluator = ProbingEvaluator(
+        device=device,
+        model=model,
+        probe_train_ds=probe_train_ds,
+        probe_val_ds=probe_val_ds,
+        quick_debug=False,
+    )
+
+    prober = evaluator.train_pred_prober()
+
+    avg_losses = evaluator.evaluate_all(prober=prober)
+
+
+    for probe_attr, loss in avg_losses.items():
+        print(f"{probe_attr} loss: {loss}")
+    
+    return avg_losses
+    
