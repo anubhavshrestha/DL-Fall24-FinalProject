@@ -1,9 +1,8 @@
 from dataset import create_wall_dataloader
 from evaluator import ProbingEvaluator
 import torch
-from models import JEPAVICReg
+from models import WorldModel
 import glob
-
 
 def get_device():
     """Check for GPU availability."""
@@ -13,7 +12,7 @@ def get_device():
 
 
 def load_data(device):
-    data_path = "/scratch/DL24FA"
+    data_path = "/drive_reader/as16386/DL24FA"
 
     probe_train_ds = create_wall_dataloader(
         data_path=f"{data_path}/probe_normal/train",
@@ -36,18 +35,56 @@ def load_data(device):
         train=False,
     )
 
-    probe_val_ds = {"normal": probe_val_normal_ds, "wall": probe_val_wall_ds}
+    probe_val_wall_other_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_wall_other/val",
+        probing=True,
+        device=device,
+        train=False,
+    )
+
+    probe_val_ds = {
+        "normal": probe_val_normal_ds,
+        "wall": probe_val_wall_ds,
+        "wall_other": probe_val_wall_other_ds,
+    }
 
     return probe_train_ds, probe_val_ds
 
 
-def load_model():
-    """Load the trained JEPA-VICReg model."""
-    model = JEPAVICReg()
-    # Load the trained weights
-    model.load_state_dict(torch.load('model_weights.pth'))
-    model = model.cuda()
-    model.eval()
+def load_expert_data(device):
+    data_path = "/drive_reader/as16386/DL24FA"
+
+    probe_train_expert_ds = create_wall_dataloader(
+        data_path=f"{data_path}/probe_expert/train",
+        probing=True,
+        device=device,
+        train=True,
+    )
+
+    probe_val_expert_ds = {
+        "expert": create_wall_dataloader(
+            data_path=f"{data_path}/probe_expert/val",
+            probing=True,
+            device=device,
+            train=False,
+        )
+    }
+
+    return probe_train_expert_ds, probe_val_expert_ds
+
+
+def load_model(checkpoint_path):
+    """Load or initialize the model."""
+    # TODO: Replace MockModel with your trained model
+    # model = MockModel()
+    # return model
+    model = WorldModel(loss_type='both')
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.cuda()
+    model.eval() 
     return model
 
 
@@ -70,6 +107,14 @@ def evaluate_model(device, model, probe_train_ds, probe_val_ds):
 
 if __name__ == "__main__":
     device = get_device()
+
+    model = load_model('/drive_reader/as16386/DL-final-proj/Chill-Pill/checkpoints/baseline_combined_lr_reduced/checkpoint_epoch_87.pt')
+    
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {total_params:,}")
+    
     probe_train_ds, probe_val_ds = load_data(device)
-    model = load_model()
     evaluate_model(device, model, probe_train_ds, probe_val_ds)
+
+    probe_train_expert_ds, probe_val_expert_ds = load_expert_data(device)
+    evaluate_model(device, model, probe_train_expert_ds, probe_val_expert_ds)

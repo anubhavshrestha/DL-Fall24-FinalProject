@@ -5,17 +5,30 @@ from datetime import datetime
 from tqdm import tqdm
 import wandb
 import os
-from models import WorldModelVICReg, Encoder, TransitionModel, VICRegLoss, BarlowTwinsLoss
+import random
+from models import WorldModel
 from dataset import WallSample, create_wall_dataloader
 from evaluator import ProbingEvaluator
+import numpy as np 
 
+def set_all_seeds(seed):
+    """Set all seeds for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(seed)
+    random.seed(seed)
 
 def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Train World Model')
     
     # Existing arguments
-    parser.add_argument('--loss_type', type=str, default='vicreg', choices=['vicreg', 'barlow'],
+    parser.add_argument('--seed', type=int, default=42,
+                      help='Random seed for reproducibility')
+
+    parser.add_argument('--loss_type', type=str, default='vicreg', choices=['vicreg', 'barlow', 'both'],
                       help='Loss function to use (default: vicreg)')
     parser.add_argument('--use_validation', action='store_true',
                       help='Whether to perform validation (default: False)')
@@ -31,19 +44,26 @@ def get_args():
                       help='Directory to save checkpoints')
 
     # Training hyperparameters
-    parser.add_argument('--learning_rate', type=float, default=3e-5,
+    parser.add_argument('--learning_rate', type=float, default=3e-,
                       help='Learning rate (default: 3e-5)')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
+    parser.add_argument('--weight_decay', type=float, default=0,
                       help='Weight decay (default: 1e-5)')
     parser.add_argument('--batch_size', type=int, default=128,
                       help='Batch size (default: 128)')
-    parser.add_argument('--num_epochs', type=int, default=100,
-                      help='Number of epochs to train (default: 100)')
+    parser.add_argument('--num_epochs', type=int, default=200,
+                      help='Number of epochs to train (default: 200)')
     parser.add_argument('--prober_lr', type=float, default=1e-3,
                       help='Learning rate for prober (default: 1e-3)')
-    parser.add_argument('--scheduler', type=str, default='cosine', 
+    parser.add_argument('--scheduler', type=str, default='none', 
                       choices=['cosine', 'onecycle', 'none'],
-                      help='Learning rate scheduler (default: cosine)')
+                      help='Learning rate scheduler (default: none)')
+    parser.add_argument('--encoder', type=str, default='small', 
+                      choices=['small'],
+                      help='Encoder Type (if multiple options available)')  
+    parser.add_argument('--predictor', type=str, default='small', 
+                      choices=['small', 'medium', 'large', 'xl'],
+                      help='Predictor Type (if multiple options available)') 
+
     # Loss function hyperparameters
     parser.add_argument('--lambda_param', type=float, default=None,
                       help='Lambda parameter (default: 25.0 for VICReg, 0.005 for Barlow)')
@@ -112,10 +132,10 @@ def evaluate_model(device, model, probe_train_ds, probe_val_ds):
     return avg_losses
 
 class WorldModelTrainer:
-    def __init__(self, model, train_loader, val_loader, learning_rate=3e-5, 
+    def __init__(self, model, train_loader, val_loader, learning_rate=3e-4, 
              device='cuda', probe_train_data=None, probe_val_data=None,
              use_validation=False, wandb_project=None, wandb_name=None,
-             checkpoint_dir='checkpoints', save_frequency=1, scheduler_type='cosine'):
+             checkpoint_dir='checkpoints', save_frequency=1, scheduler_type='cosine', seed=42):
 
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -126,7 +146,7 @@ class WorldModelTrainer:
         self.use_validation = use_validation
         self.checkpoint_dir = os.path.join(checkpoint_dir, wandb_name)
         self.save_frequency = save_frequency
-        
+        self.seed = seed 
         # Create checkpoint directory
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         
@@ -136,7 +156,7 @@ class WorldModelTrainer:
             lr=learning_rate, 
             weight_decay=1e-5
         )
-
+        print('parameter count', sum(p.numel() for p in model.parameters()))
 
         if scheduler_type == 'cosine':
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -147,10 +167,10 @@ class WorldModelTrainer:
         elif scheduler_type == 'onecycle':
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
-                max_lr=learning_rate,
+                max_lr=learning_rate * 10,
                 epochs=args.num_epochs,
                 steps_per_epoch=len(train_loader),
-                pct_start=0.3  # 30% of training for warmup
+                pct_start=0.2  # 40% of training for warmup
             )
         else:
             self.scheduler = None
@@ -165,6 +185,7 @@ class WorldModelTrainer:
                     "batch_size": train_loader.batch_size,
                     "loss_type": model.loss_type,
                     "use_validation": use_validation,
+                    "seed": seed
                 }
             )
             # Log model architecture
@@ -174,12 +195,7 @@ class WorldModelTrainer:
         """Run validation loop and compute losses."""
         self.model.eval()
         total_val_loss = 0.0
-        val_losses = {
-            'total_loss': 0.0,
-            'sim_loss' if self.model.loss_type == 'vicreg' else 'on_diag_loss': 0.0,
-            'std_loss' if self.model.loss_type == 'vicreg' else 'off_diag_loss': 0.0,
-            'cov_loss' if self.model.loss_type == 'vicreg' else 'total_loss': 0.0
-        }
+        val_losses = None
         
         with torch.no_grad():
             for batch in self.val_loader:
@@ -190,8 +206,12 @@ class WorldModelTrainer:
                     WallSample(states=states, actions=actions, locations=batch.locations)
                 )
                 
+                # Initialize val_losses on first batch
+                if val_losses is None:
+                    val_losses = {k: 0.0 for k in component_losses}
+                
                 total_val_loss += loss.item()
-                for k in val_losses:
+                for k in component_losses:
                     val_losses[k] += component_losses[k]
         
         # Average the losses
@@ -206,13 +226,10 @@ class WorldModelTrainer:
         """Train for one epoch."""
         self.model.train()
         total_train_loss = 0.0
-        train_losses = {
-            'total_loss': 0.0,
-            'sim_loss' if self.model.loss_type == 'vicreg' else 'on_diag_loss': 0.0,
-            'std_loss' if self.model.loss_type == 'vicreg' else 'off_diag_loss': 0.0,
-            'cov_loss' if self.model.loss_type == 'vicreg' else 'total_loss': 0.0
-        }
         
+        # Initialize train_losses based on first batch components
+        train_losses = None
+            
         for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch}")):
             self.optimizer.zero_grad()
             
@@ -224,19 +241,23 @@ class WorldModelTrainer:
                 WallSample(states=states, actions=actions, locations=batch.locations)
             )
             
+            # Initialize train_losses on first batch
+            if train_losses is None:
+                train_losses = {k: 0.0 for k in component_losses}
+            
             # Backward pass
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             
             self.optimizer.step()
             
-            # Step OneCycleLR scheduler if used (needs per-batch stepping)
+            # Step OneCycleLR scheduler if used
             if self.scheduler is not None and isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
                 self.scheduler.step()
 
             # Update running losses
             total_train_loss += loss.item()
-            for k in train_losses:
+            for k in component_losses:
                 train_losses[k] += component_losses[k]
             
             # Log batch metrics to WandB
@@ -354,13 +375,18 @@ def create_train_val_loaders(data_path, train_samples=None, val_samples=None):
 if __name__ == "__main__":
     # Parse arguments
     args = get_args()
-    
+
+    print(f"Setting random seed: {args.seed}")
+    set_all_seeds(args.seed)
+
     # Create model with specified loss
-    model = WorldModelVICReg(
+    model = WorldModel(
         loss_type=args.loss_type,
         lambda_param=25.0 if args.loss_type == 'vicreg' else 0.005,
         mu_param=25.0 if args.loss_type == 'vicreg' else None,
-        nu_param=1.0 if args.loss_type == 'vicreg' else None
+        nu_param=1.0 if args.loss_type == 'vicreg' else None, 
+        encoder=args.encoder, 
+        predictor=args.predictor
     )
 
     # Create dataloaders
@@ -385,8 +411,10 @@ if __name__ == "__main__":
         wandb_name=args.wandb_name,
         checkpoint_dir=args.checkpoint_dir,
         save_frequency=args.save_frequency, 
-        scheduler_type=args.scheduler
+        scheduler_type=args.scheduler, 
+        seed=args.seed, 
+        learning_rate=args.learning_rate
     )
     
     # Start training
-    trainer.train(num_epochs=100)
+    trainer.train(num_epochs=300)

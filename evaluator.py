@@ -52,7 +52,6 @@ class ProbingEvaluator:
         probe_val_ds: dict,
         config: ProbingConfig = default_config,
         quick_debug: bool = False,
-        learning_rate: float = 1e-3
     ):
         self.device = device
         self.config = config
@@ -66,7 +65,6 @@ class ProbingEvaluator:
         self.val_ds = probe_val_ds
 
         self.normalizer = Normalizer()
-        self.learning_rate = learning_rate 
 
     def train_pred_prober(self):
         """
@@ -93,7 +91,7 @@ class ProbingEvaluator:
         all_parameters = []
         all_parameters += list(prober.parameters())
 
-        optimizer_pred_prober = torch.optim.Adam(all_parameters, self.learning_rate)
+        optimizer_pred_prober = torch.optim.Adam(all_parameters, config.lr)
 
         step = 0
 
@@ -114,7 +112,8 @@ class ProbingEvaluator:
             for batch in tqdm(dataset, desc="Probe prediction step"):
                 ################################################################################
                 # TODO: Forward pass through your model
-                pred_encs = model(states=batch.states, actions=batch.actions)
+                init_states = batch.states[:, 0:1]  # BS, 1, C, H, W
+                pred_encs = model(states=init_states, actions=batch.actions)
                 pred_encs = pred_encs.transpose(0, 1)  # # BS, T, D --> T, BS, D
 
                 # Make sure pred_encs has shape (T, BS, D) at this point
@@ -166,7 +165,7 @@ class ProbingEvaluator:
                 loss.backward()
                 optimizer_pred_prober.step()
 
-                lr = scheduler.adjust_learning_rate(step)
+                # lr = scheduler.adjust_learning_rate(step)
 
                 step += 1
 
@@ -213,9 +212,6 @@ class ProbingEvaluator:
             # TODO: Forward pass through your model
             init_states = batch.states[:, 0:1]  # BS, 1 C, H, W
             pred_encs = model(states=init_states, actions=batch.actions)
-            # print("INIT STATE: ", init_states)
-            # print("ACTIONS: ", batch.actions)
-            # print(" pred_encs: ", pred_encs.shape)
             # # BS, T, D --> T, BS, D
             pred_encs = pred_encs.transpose(0, 1)
 
@@ -236,25 +232,3 @@ class ProbingEvaluator:
         average_eval_loss = losses_t.mean().item()
 
         return average_eval_loss
-
-
-
-def evaluate_model(device, model, probe_train_ds, probe_val_ds):
-    evaluator = ProbingEvaluator(
-        device=device,
-        model=model,
-        probe_train_ds=probe_train_ds,
-        probe_val_ds=probe_val_ds,
-        quick_debug=False,
-    )
-
-    prober = evaluator.train_pred_prober()
-
-    avg_losses = evaluator.evaluate_all(prober=prober)
-
-
-    for probe_attr, loss in avg_losses.items():
-        print(f"{probe_attr} loss: {loss}")
-    
-    return avg_losses
-    
