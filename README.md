@@ -1,5 +1,8 @@
 # CSCI-GA 2572 Final Project
 
+# Team Members:
+Aadim Nepal, Bimarsha Adhikari, Anubhav Shrestha
+
 ## Overview
 
 In this project, you will train a JEPA world model on a set of pre-collected trajectories from a toy environment involving an agent in two rooms.
