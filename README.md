@@ -1,4 +1,5 @@
 # CSCI-GA 2572 Final Project
+This is the final project for NYU Deep Learning class taught by Yann LeCun and Alfredo Canziani. Our team was ranked #4 out of 37 graduate teams.
 
 # Team Members:
 Aadim Nepal, Bimarsha Adhikari, Anubhav Shrestha
